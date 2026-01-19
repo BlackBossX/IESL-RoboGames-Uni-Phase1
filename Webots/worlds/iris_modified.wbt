@@ -1,0 +1,258 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/Floor.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/apartment_structure/protos/Wall.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/Soil.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/solids/protos/SolidBox.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/shapes/protos/TexturedBoxShape.proto"
+EXTERNPROTO "../protos/Iris.proto"
+
+WorldInfo {
+  title "Iris Ardupilot"
+  basicTimeStep 1
+  FPS 20
+}
+Viewpoint {
+  orientation -0.12128114352621157 0.6977204542774929 0.7060290729904708 0.81652297936308
+  position -10.311205935354154 -6.914433386823727 6.773590358086054
+  follow "Iris"
+  followSmoothness 0.01
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+Solid {
+  children [
+    Floor {
+      size 8 8
+      appearance Soil {
+      }
+    }
+  ]
+  name "floor"
+  boundingObject Plane {
+    size 8 8
+  }
+}
+Solid {
+  translation 2.772285338488082 2.8281674992385435 0.20360167373374957
+  rotation -0.585992123276617 0.46380260582885185 -0.6644549452627533 0.013796325291716857
+  children [
+    TexturedBoxShape {
+      size 0.5 0.5 0.4
+      textureUrl [
+        "../images/AprilTag-ID5.jpg"
+      ]
+      textureMapping "default"
+      faceColor 0.6 0.6 0.6
+      frontFace FALSE
+      backFace FALSE
+      leftFace FALSE
+      rightFace FALSE
+      bottomFace FALSE
+    }
+  ]
+  name "landing_pad_stand_2"
+  boundingObject DEF Landing_Pad Box {
+    size 0.5 0.5 0.4
+  }
+  physics Physics {
+    mass 1
+    centerOfMass [
+      0 0 0
+    ]
+    damping Damping {
+      linear 1
+    }
+  }
+  angularVelocity 2.192975168525081e-09 -3.580806601847337e-09 -1.1714490859600709e-07
+}
+Solid {
+  translation 2.782294628181052 -2.832682202407343 0.20256324091943287
+  rotation 0.9999980259568374 -2.959194584339238e-05 0.0019867578476219483 0.01031967338424633
+  children [
+    TexturedBoxShape {
+      size 0.5 0.5 0.4
+      textureUrl [
+        "../images/AprilTag-tag36h11-ID7.png"
+      ]
+      textureMapping "default"
+      faceColor 0.6 0.6 0.6
+      frontFace FALSE
+      backFace FALSE
+      leftFace FALSE
+      rightFace FALSE
+      bottomFace FALSE
+    }
+  ]
+  name "landing_pad_stand_3"
+  boundingObject DEF Landing_Pad Box {
+    size 0.5 0.5 0.4
+  }
+  physics Physics {
+    mass 1
+    centerOfMass [
+      0 0 0
+    ]
+    damping Damping {
+      linear 1
+    }
+  }
+  angularVelocity -1.835002287088492e-09 5.852614360189459e-13 -2.3256729813869527e-09
+}
+Solid {
+  translation -2.8469648083801324 2.7977116292986195 0.20148280084418807
+  rotation -0.6761487447726844 -0.6880790566516781 -0.26338201673550155 0.024864923432068694
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.6 0.6 0.6
+        metalness 0
+      }
+      geometry Box {
+        size 0.5 0.5 0.4
+      }
+    }
+  ]
+  name "landing_pad_stand_1"
+  boundingObject Cylinder {
+    height 0.4
+    radius 0.1
+  }
+  physics Physics {
+    centerOfMass [
+      0 0 0
+    ]
+    damping Damping {
+      linear 1
+    }
+  }
+  angularVelocity 0.00960254080145183 0.01270617962326554 -0.00017711284594301954
+}
+Solid {
+  translation 1.0169 2.78305 -1.72543e-05
+  rotation 5.273220331722632e-05 0.999999997290281 5.136878910735384e-05 1.5708971326786452
+  children [
+    SolidBox {
+      translation 0 0 -1.04
+      size 0.01 0.1 5.2
+      appearance PBRAppearance {
+        baseColor 1 1 0
+        roughness 0.5
+        metalness 0
+      }
+    }
+  ]
+  name "Strip 1"
+}
+Solid {
+  translation 2.7869 -0.98695 -4.0694e-07
+  rotation 0.5773489358556708 -0.5773509358554485 -0.5773509358554485 -2.094395307179586
+  children [
+    SolidBox {
+      translation 0 0 0.99
+      size 0.01 0.1 5.2
+      appearance PBRAppearance {
+        baseColor 1 1 0
+        roughness 0.5
+        metalness 0
+      }
+    }
+  ]
+  name "Strip 2"
+}
+Wall {
+  translation 0 3.98 0
+  size 8 0.05 0.2
+  appearance Appearance {
+    material Material {
+    }
+    texture ImageTexture {
+      url [
+        "../images/RoboGames Logo_extended.jpg"
+      ]
+    }
+    textureTransform TextureTransform {
+      scale 12 1
+    }
+  }
+}
+Wall {
+  translation 0 -3.98 0
+  name "wall(2)"
+  size 8 0.05 0.2
+  appearance Appearance {
+    material Material {
+    }
+    texture ImageTexture {
+      url [
+        "../images/RoboGames Logo_extended.jpg"
+      ]
+    }
+    textureTransform TextureTransform {
+      scale 12 1
+    }
+  }
+}
+Wall {
+  translation 3.98 1.22354e-07 0
+  rotation 0 0 1 -1.5707953071795862
+  name "wall(1)"
+  size 8 0.05 0.2
+  appearance Appearance {
+    material Material {
+    }
+    texture ImageTexture {
+      url [
+        "../images/RoboGames Logo_extended.jpg"
+      ]
+    }
+    textureTransform TextureTransform {
+      scale 12 1
+    }
+  }
+}
+Wall {
+  translation -3.98 -7.99381e-06 0
+  rotation 0 0 1 -1.5707953071795862
+  name "wall(3)"
+  size 8 0.05 0.2
+  appearance Appearance {
+    material Material {
+    }
+    texture ImageTexture {
+      url [
+        "../images/RoboGames Logo_extended.jpg"
+      ]
+    }
+    textureTransform TextureTransform {
+      scale 12 1
+    }
+  }
+}
+Iris {
+  hidden linearVelocity_0 0.005724629619231091 -0.004415268220168082 -0.0007349142297940472
+  hidden angularVelocity_0 0.011196594729997688 0.012888381811439866 -0.0001531976400890105
+  translation -2.8651171439423893 2.8127550919565354 0.45598862668288614
+  rotation -0.41485778444645677 -0.4339613040273678 -0.7997315832771915 0.04005853509683821
+  controller "<extern>"
+  controllerArgs [
+    "--motors"
+    "m1_motor, m2_motor, m3_motor, m4_motor"
+    "--camera"
+    "camera"
+    "--camera-port"
+    "5599"
+  ]
+  extensionSlot [
+    Camera {
+      translation 0.05 0 0.05
+      rotation 0 1 0 1.57079632679
+      width 640
+      height 480
+    }
+  ]
+}
