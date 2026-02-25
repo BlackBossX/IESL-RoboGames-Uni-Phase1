@@ -20,9 +20,12 @@ class Camera:
 
     def start_thread(self, callback):
         """Start the TCP camera thread"""
+        if self.thread_stop_event is not None:
+            return  # already running
+        self.thread_stop_event = threading.Event()  # init BEFORE starting thread
+
         def camera_thread():
-            if self.thread_stop_event is None:
-                self.thread_stop_event = threading.Event()
+            try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.connect((self.host, self.port))
                     print(f"Connected to camera at {self.host}:{self.port}")
@@ -33,6 +36,11 @@ class Camera:
                         else:
                             print("Failed to receive frame")
                             break
+            except Exception as e:
+                print(f"Camera thread error: {e}")
+            finally:
+                self.thread_stop_event.set()
+
         self.camera_thread = threading.Thread(target=camera_thread, daemon=True)
         self.camera_thread.start()
 
@@ -40,21 +48,26 @@ class Camera:
         """Stop the TCP camera thread"""
         if self.thread_stop_event is not None:
             self.thread_stop_event.set()
-            self.camera_thread.join()
+            if self.camera_thread is not None:
+                self.camera_thread.join(timeout=2)
             self.thread_stop_event = None
-        cv2.destroyAllWindows()
+            self.camera_thread = None
 
     def get_frame(self, s):
-        """Get the latest camera frame"""
+        """Get the latest camera frame (RGB from Webots, converted to BGR for OpenCV)"""
         # 1. Read Header (4 bytes: Width, Height)
         header_data = self._recv_all(s, 4)
         if not header_data: return None
         width, height = struct.unpack("=HH", header_data)
 
+        # 2. Read RGB image data (3 bytes per pixel)
         img_data = self._recv_all(s, width * height * 3)
         if not img_data: return None
-        frame = np.frombuffer(img_data, dtype=np.uint8).reshape((height, width, 3))
-        return frame
+
+        # 3. Reshape as RGB then convert to BGR for OpenCV
+        frame_rgb = np.frombuffer(img_data, dtype=np.uint8).reshape((height, width, 3))
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        return frame_bgr
 
 
     def is_running(self):
@@ -70,6 +83,5 @@ class Camera:
         return data
     
     def __del__(self):
-        """Destructor to ensure threads are stopped and windows closed"""
+        """Destructor to ensure threads are stopped"""
         self.stop_thread()
-        cv2.destroyAllWindows()
