@@ -29,6 +29,24 @@ class Control:
         time.sleep(2)
         print(f"Mode set to {mode}.")
     
+    def force_arm(self):
+        """Force-arm the drone, bypassing all pre-arm safety checks"""
+        print("Force-arming motors...")
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            1,      # arm
+            21196,  # force-arm magic number for ArduPilot
+            0, 0, 0, 0, 0
+        )
+        time.sleep(1)
+        if self.is_armed():
+            print("Force-arm successful!")
+        else:
+            print("Warning: force-arm may not have taken effect.")
+
     def arm_motors(self):
         """Arm the drone motors"""
         print("Arming motors...")
@@ -150,7 +168,7 @@ class Control:
         return final_yaw
 
     def land(self):
-        """Land the drone"""
+        """Land the drone and wait until it touches the ground and disarms"""
         print("Landing...")
         self.master.mav.command_long_send(
             self.master.target_system,
@@ -160,10 +178,19 @@ class Control:
             0, 0, 0, 0,
             0, 0, 0
         )
-        # Wait until disarmed
+        # Monitor altitude until on the ground (< 0.05 m) then wait for disarm
+        while True:
+            msg = self.master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=2)
+            if msg is not None:
+                alt = msg.relative_alt / 1000.0  # mm → m
+                print(f"Landing... altitude: {alt:.2f} m")
+                if alt < 0.05:
+                    print("On the ground. Waiting for motors to disarm...")
+                    break
+            time.sleep(0.5)
+        # Wait until fully disarmed
         while self.is_armed():
-            print("Waiting for landing...")
-            time.sleep(1)
+            time.sleep(0.5)
         print("Landed and motors disarmed!")
 
     

@@ -2,7 +2,6 @@
 This contains the opencv, line following stuff. This will make the decisions for the robot based on what the camera sees and 
 send commands to the controller.
 '''
-t
 import cv2
 import numpy as np
 from control import Control
@@ -19,7 +18,6 @@ class Brain:
         Process the camera frame to detect lines and make decisions.
         use Camera class to get the frames.
         """
-        
         pass
         
 
@@ -35,12 +33,25 @@ class Brain:
         pass
 
     def start(self):
-        """Start the processing"""
-        self.camera.start_thread(self.process_frame)
+        """Force arm → takeoff 0.27 m → land"""
+        print("MAVLink connected. Starting flight sequence...")
+
+        # 1. Set GUIDED mode
         self.control.set_mode('GUIDED')
-        self.control.arm_motors()
+
+        # 2. Force arm (bypasses pre-arm checks)
+        self.control.force_arm()
+
+        # 3. Takeoff to 0.27 m
         self.control.takeoff(0.27)
-        # Add the rest as needed, like line following loop, landing logic, etc.
+
+        # 4. Hover briefly so the altitude is stable
+        print("Hovering at 0.27 m for 3 seconds...")
+        time.sleep(3)
+
+        # 5. Land back to ground
+        self.control.land()
+        print("Flight sequence complete.")
     
     def __del__(self):
         """Destructor to ensure threads are stopped"""
