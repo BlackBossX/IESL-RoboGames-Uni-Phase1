@@ -354,7 +354,10 @@ class Brain:
                 type='GLOBAL_POSITION_INT', blocking=False)
             if alt_msg:
                 alt = alt_msg.relative_alt / 1000.0
-                if alt < 0.25:
+                if alt < 0.30:
+                    # Slow down even more for the final stretch
+                    self.control.set_velocity(vx=0, vy=0, vz=0.03)
+                if alt < 0.08:
                     print(f"[BOX] Altitude {alt:.2f} m — handing off to land.")
                     self.control.set_velocity(0, 0, 0)
                     break
