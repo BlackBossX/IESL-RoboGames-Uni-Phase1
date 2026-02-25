@@ -124,7 +124,7 @@ class Brain:
 
     # ── main sequence ────────────────────────────────────────────────────────
     def start(self):
-        """Force arm → takeoff 0.27 m → hover & track → land"""
+        """Force arm → takeoff 3 m → hover & track → land"""
         print("MAVLink connected. Starting flight sequence...")
 
         # 1. Set GUIDED mode
@@ -133,8 +133,8 @@ class Brain:
         # 2. Force arm (bypasses pre-arm checks)
         self.control.force_arm()
 
-        # 3. Takeoff to 0.27 m
-        self.control.takeoff(0.27)
+        # 3. Takeoff to 3 m
+        self.control.takeoff(3.0)
 
         # 4. Start camera now that drone is airborne
         self.camera.start_thread(self.process_frame)
