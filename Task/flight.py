@@ -47,6 +47,12 @@ class Brain:
         self._pid_last_time = None
         self._vy_smooth = 0.0          # smoothed lateral output
 
+        # AprilTag detector (tag36h11 family used in world)
+        self._tag_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
+        self._tag_params = cv2.aruco.DetectorParameters()
+        self._tag_detector = cv2.aruco.ArucoDetector(self._tag_dict, self._tag_params)
+        self._tag_land_area = 20000  # px² — trigger landing only when drone is directly over pad
+
     # ── frame processing (runs in camera thread) ─────────────────────────────
     def process_frame(self, frame):
         """
@@ -122,7 +128,25 @@ class Brain:
         """Return the most recently detected objects (thread-safe read)."""
         return list(self._latest_detections)
 
-    def _pid(self, error, kp=0.0010, ki=0.00002, kd=0.003, deadband=12):
+    def _detect_apriltag(self, frame):
+        """Detect AprilTag in frame. Returns (tag_id, cx, cy, area, corners) or None."""
+        corners, ids, _ = self._tag_detector.detectMarkers(frame)
+        if ids is None or len(ids) == 0:
+            return None
+        best, best_area = None, 0
+        for i, tc in enumerate(corners):
+            c = tc[0]
+            w = np.linalg.norm(c[0] - c[1])
+            h = np.linalg.norm(c[0] - c[3])
+            area = w * h
+            if area > best_area:
+                best_area = area
+                cx = int(np.mean(c[:, 0]))
+                cy = int(np.mean(c[:, 1]))
+                best = (int(ids[i][0]), cx, cy, area, tc)
+        return best
+
+    def _pid(self, error, kp=0.0007, ki=0.000002, kd=0.0045, deadband=12):
         """PID controller — returns smoothed output given pixel error.
         deadband: errors smaller than this many pixels are treated as zero.
         """
@@ -186,6 +210,25 @@ class Brain:
                 cv2.putText(disp, status, (8, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+            # ── AprilTag detection — scan entire frame ────────────────────
+            tag = self._detect_apriltag(frame)
+            if tag is not None:
+                tid, tcx, tcy, tarea, tcorners = tag
+                print(f"[TAG] AprilTag ID={tid}  area={tarea:.0f}  center=({tcx},{tcy})")
+                cv2.aruco.drawDetectedMarkers(disp, [tcorners], np.array([[tid]]))
+                cv2.putText(disp, f"TAG ID={tid}", (tcx - 30, tcy - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                if tarea >= self._tag_land_area:
+                    print(f"[TAG] Landing pad detected! (area={tarea:.0f}) — stopping and landing.")
+                    self.control.set_velocity(0, 0, 0)
+                    time.sleep(0.5)
+                    # Push final frame before breaking
+                    try:
+                        self._frame_queue.put_nowait(disp)
+                    except queue.Full:
+                        pass
+                    break
+
             print(f"[LINE] {status}")
             self.control.set_velocity(vx=forward_speed, vy=vy, vz=0)
 
@@ -218,8 +261,8 @@ class Brain:
         # 2. Force arm
         self.control.force_arm()
 
-        # 3. Takeoff to 0.5 m (low enough to see the line clearly)
-        self.control.takeoff(0.5)
+        # 3. Takeoff to 1.5 m — high enough for camera to see full tag box
+        self.control.takeoff(1.5)
 
         # 4. Start camera
         self.camera.start_thread(self.process_frame)
@@ -227,8 +270,8 @@ class Brain:
         while self._latest_frame is None:
             time.sleep(0.05)
 
-        # 5. Follow the yellow line for 30 seconds
-        self.line_follow(duration=30, forward_speed=0.15)
+        # 5. Follow the yellow line (up to 45 s, or until AprilTag pad detected)
+        self.line_follow(duration=120, forward_speed=0.25)
 
         cv2.destroyAllWindows()
 
