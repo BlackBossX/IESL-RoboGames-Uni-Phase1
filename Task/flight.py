@@ -146,7 +146,7 @@ class Brain:
                 best = (int(ids[i][0]), cx, cy, area, tc)
         return best
 
-    def _pid(self, error, kp=0.0007, ki=0.000002, kd=0.0045, deadband=12):
+    def _pid(self, error, kp=0.0005, ki=0.000001, kd=0.006, deadband=18):
         """PID controller — returns smoothed output given pixel error.
         deadband: errors smaller than this many pixels are treated as zero.
         """
@@ -156,12 +156,12 @@ class Brain:
         dt = (now - self._pid_last_time) if self._pid_last_time else 0.05
         self._pid_last_time = now
         self._pid_integral += error * dt
-        self._pid_integral = max(-150, min(150, self._pid_integral))   # anti-windup
+        self._pid_integral = max(-100, min(100, self._pid_integral))   # anti-windup
         derivative = (error - self._pid_last_error) / max(dt, 1e-4)
         self._pid_last_error = error
         raw = kp * error + ki * self._pid_integral + kd * derivative
-        # Exponential moving average — alpha=0.25 keeps only 25% new, 75% old
-        self._vy_smooth = 0.25 * raw + 0.75 * self._vy_smooth
+        # Exponential moving average — alpha=0.15 keeps only 15% new, 85% old
+        self._vy_smooth = 0.15 * raw + 0.85 * self._vy_smooth
         return self._vy_smooth
 
     def line_follow(self, duration=30, forward_speed=0.2, land_on_tag=True, tag_ignore_secs=0):
@@ -197,7 +197,7 @@ class Brain:
                 cx = int(M['m10'] / M['m00'])       # centroid x in ROI
                 error = cx - fw // 2                # +ve = line is right → steer right
                 vy = self._pid(error)
-                vy = max(-0.25, min(0.25, vy))      # tighter clamp for smoother flight
+                vy = max(-0.15, min(0.15, vy))      # tight clamp for smooth flight
                 status = f"Line @ x={cx}  err={error:+d}  vy={vy:+.3f}"
 
                 # Draw line position on latest display frame
