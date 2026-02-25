@@ -45,6 +45,7 @@ class Brain:
         self._pid_integral = 0.0
         self._pid_last_error = 0.0
         self._pid_last_time = None
+        self._vy_smooth = 0.0          # smoothed lateral output
 
     # ── frame processing (runs in camera thread) ─────────────────────────────
     def process_frame(self, frame):
@@ -121,16 +122,23 @@ class Brain:
         """Return the most recently detected objects (thread-safe read)."""
         return list(self._latest_detections)
 
-    def _pid(self, error, kp=0.002, ki=0.00005, kd=0.008):
-        """PID controller — returns output given pixel error."""
+    def _pid(self, error, kp=0.0010, ki=0.00002, kd=0.003, deadband=12):
+        """PID controller — returns smoothed output given pixel error.
+        deadband: errors smaller than this many pixels are treated as zero.
+        """
+        if abs(error) < deadband:
+            error = 0  # ignore tiny wobble
         now = time.time()
         dt = (now - self._pid_last_time) if self._pid_last_time else 0.05
         self._pid_last_time = now
         self._pid_integral += error * dt
-        self._pid_integral = max(-200, min(200, self._pid_integral))   # anti-windup
+        self._pid_integral = max(-150, min(150, self._pid_integral))   # anti-windup
         derivative = (error - self._pid_last_error) / max(dt, 1e-4)
         self._pid_last_error = error
-        return kp * error + ki * self._pid_integral + kd * derivative
+        raw = kp * error + ki * self._pid_integral + kd * derivative
+        # Exponential moving average — alpha=0.25 keeps only 25% new, 75% old
+        self._vy_smooth = 0.25 * raw + 0.75 * self._vy_smooth
+        return self._vy_smooth
 
     def line_follow(self, duration=30, forward_speed=0.2):
         """
@@ -163,7 +171,7 @@ class Brain:
                 cx = int(M['m10'] / M['m00'])       # centroid x in ROI
                 error = cx - fw // 2                # +ve = line is right → steer right
                 vy = self._pid(error)
-                vy = max(-0.5, min(0.5, vy))        # clamp lateral speed
+                vy = max(-0.25, min(0.25, vy))      # tighter clamp for smoother flight
                 status = f"Line @ x={cx}  err={error:+d}  vy={vy:+.3f}"
 
                 # Draw line position on latest display frame
@@ -220,7 +228,7 @@ class Brain:
             time.sleep(0.05)
 
         # 5. Follow the yellow line for 30 seconds
-        self.line_follow(duration=30, forward_speed=0.2)
+        self.line_follow(duration=30, forward_speed=0.15)
 
         cv2.destroyAllWindows()
 
