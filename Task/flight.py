@@ -164,17 +164,17 @@ class Brain:
         self._vy_smooth = 0.25 * raw + 0.75 * self._vy_smooth
         return self._vy_smooth
 
-    def line_follow(self, duration=30, forward_speed=0.2, land_on_tag=True):
+    def line_follow(self, duration=30, forward_speed=0.2, land_on_tag=True, tag_ignore_secs=0):
         """
         PID line follower using the yellow line detected by the downward camera.
         Uses the bottom 40% of the frame as region-of-interest.
-        Runs for `duration` seconds, or until an AprilTag threshold is hit.
-        land_on_tag=True  → stop and return True (caller should land)
-        land_on_tag=False → stop and return True (caller should turn, then call again)
+        tag_ignore_secs: suppress AprilTag detection for this many seconds at start
+                         (use for phase 2 to avoid re-triggering on the first tag).
         Returns True if tag triggered exit, False if timed out.
         """
-        print(f"Line following for {duration}s  (forward={forward_speed} m/s)")
+        print(f"Line following for {duration}s  (forward={forward_speed} m/s, tag_ignore={tag_ignore_secs}s)")
         fw = 640  # frame width — will update from first frame
+        tag_ignore_until = time.time() + tag_ignore_secs
 
         deadline = time.time() + duration
         while time.time() < deadline:
@@ -213,8 +213,12 @@ class Brain:
                 cv2.putText(disp, status, (8, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            # ── AprilTag detection — scan entire frame ────────────────────
-            tag = self._detect_apriltag(frame)
+            # ── AprilTag detection — scan entire frame (skipped during ignore window) ──
+            if time.time() >= tag_ignore_until:
+                tag = self._detect_apriltag(frame)
+            else:
+                tag = None  # still in ignore window
+
             if tag is not None:
                 tid, tcx, tcy, tarea, tcorners = tag
                 print(f"[TAG] AprilTag ID={tid}  area={tarea:.0f}  center=({tcx},{tcy})")
@@ -296,7 +300,7 @@ class Brain:
 
             # 8. Phase 2 — follow next line to second AprilTag, then land
             print("=== Phase 2: following line to second AprilTag ===")
-            self.line_follow(duration=120, forward_speed=0.25, land_on_tag=True)
+            self.line_follow(duration=120, forward_speed=0.25, land_on_tag=True, tag_ignore_secs=10)
         else:
             print("Timed out on phase 1 without finding tag — landing.")
 
