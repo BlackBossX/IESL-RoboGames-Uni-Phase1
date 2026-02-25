@@ -168,9 +168,8 @@ class Brain:
         """
         PID line follower using the yellow line detected by the downward camera.
         Uses the bottom 40% of the frame as region-of-interest.
-        tag_ignore_secs: suppress AprilTag detection for this many seconds at start
-                         (use for phase 2 to avoid re-triggering on the first tag).
-        Returns True if tag triggered exit, False if timed out.
+        tag_ignore_secs: suppress AprilTag detection for this many seconds at start.
+        Returns the detected tag ID (int) if tag triggered exit, or None if timed out.
         """
         print(f"Line following for {duration}s  (forward={forward_speed} m/s, tag_ignore={tag_ignore_secs}s)")
         fw = 640  # frame width — will update from first frame
@@ -228,15 +227,17 @@ class Brain:
                 if tarea >= self._tag_land_area:
                     print(f"[TAG] Tag large enough (area={tarea:.0f}) — stopping.")
                     self.control.set_velocity(0, 0, 0)
-                    time.sleep(0.5)
+                    time.sleep(0.3)
+                    if land_on_tag:
+                        print("[TAG] Preparing to land on box...")
+                        self._center_on_box()
                     # Push final frame before breaking
                     try:
                         self._frame_queue.put_nowait(disp)
                     except queue.Full:
                         pass
-                    return True  # tag triggered exit
+                    return tid  # return the detected tag ID
 
-            print(f"[LINE] {status}")
             self.control.set_velocity(vx=forward_speed, vy=vy, vz=0)
 
             # Push to display queue
@@ -256,7 +257,130 @@ class Brain:
         # Stop movement when done
         self.control.set_velocity(0, 0, 0)
         print("Line following complete.")
-        return False  # timed out, no tag triggered
+        return None  # timed out, no tag triggered
+
+    def _detect_box_center(self, frame):
+        """
+        Detect the landing-pad box (a large roughly-square gray/white object)
+        by finding the biggest near-square contour in the frame.
+        Returns (cx, cy, w, h) or None.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Threshold to isolate the lighter box against the darker floor
+        _, thresh = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE,
+                                  np.ones((15, 15), np.uint8))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,
+                                  np.ones((7, 7), np.uint8))
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        best, best_area = None, 3000  # minimum area threshold
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < best_area:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+            if aspect < 0.4:  # skip very elongated shapes
+                continue
+            if area > best_area:
+                best_area = area
+                cx = x + w // 2
+                cy = y + h // 2
+                best = (cx, cy, w, h)
+        return best
+
+    def _center_on_box(self, timeout=25.0):
+        """
+        Detect the physical landing box (gray/white rectangle), nudge toward
+        its centre, then descend slowly. No re-centering — commit and land.
+        """
+        # ── Step 0: full stop and hover ──────────────────────────────────
+        print("[BOX] Stopping to locate box...")
+        self.control.set_velocity(0, 0, 0)
+        time.sleep(2.0)
+
+        # ── Step 1: detect box and nudge toward its centre ───────────────
+        print("[BOX] Detecting box shape...")
+        deadline = time.time() + 12.0
+        nudged = False
+        while time.time() < deadline:
+            frame = self._latest_frame
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            fh, fw = frame.shape[:2]
+            box = self._detect_box_center(frame)
+            disp = frame.copy()
+            if box is not None:
+                bcx, bcy, bw, bh = box
+                ex = bcx - fw // 2
+                ey = bcy - fh // 2
+                # Draw box outline
+                cv2.rectangle(disp, (bcx - bw // 2, bcy - bh // 2),
+                              (bcx + bw // 2, bcy + bh // 2), (255, 0, 255), 2)
+                cv2.circle(disp, (bcx, bcy), 6, (255, 0, 255), -1)
+                cv2.putText(disp, f"BOX ex={ex:+d} ey={ey:+d} ({bw}x{bh})",
+                            (8, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+                print(f"[BOX] centre=({bcx},{bcy}) ex={ex:+d} ey={ey:+d} size={bw}x{bh}")
+
+                # Nudge: move proportionally, cap at 0.10 m/s, for 1.5–4 s
+                vy = max(-0.10, min(0.10, ex * 0.0015))
+                vx = max(-0.10, min(0.10, ey * 0.0015))
+                nudge_time = max(1.5, min(4.0, max(abs(ex), abs(ey)) * 0.015))
+                print(f"[BOX] Nudging vx={vx:+.3f} vy={vy:+.3f} for {nudge_time:.1f}s")
+                t_end = time.time() + nudge_time
+                while time.time() < t_end:
+                    self.control.set_velocity(vx=vx, vy=vy, vz=0)
+                    time.sleep(0.1)
+                self.control.set_velocity(0, 0, 0)
+                time.sleep(1.0)  # settle
+                nudged = True
+                break
+            else:
+                cv2.putText(disp, "BOX: searching...", (8, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            self._push_display(disp)
+            time.sleep(0.1)
+
+        if not nudged:
+            print("[BOX] Could not detect box — landing at current position.")
+
+        # ── Step 2: slow straight descent — no re-centering ──────────────
+        print("[BOX] Descending slowly...")
+        descent_deadline = time.time() + timeout
+        while time.time() < descent_deadline:
+            alt_msg = self.control.master.recv_match(
+                type='GLOBAL_POSITION_INT', blocking=False)
+            if alt_msg:
+                alt = alt_msg.relative_alt / 1000.0
+                if alt < 0.25:
+                    print(f"[BOX] Altitude {alt:.2f} m — handing off to land.")
+                    self.control.set_velocity(0, 0, 0)
+                    break
+            frame = self._latest_frame
+            if frame is not None:
+                disp = frame.copy()
+                cv2.putText(disp, "LANDING...", (8, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                self._push_display(disp)
+            # Very slow descent, no lateral movement
+            self.control.set_velocity(vx=0, vy=0, vz=0.06)
+            time.sleep(0.05)
+
+        self.control.set_velocity(0, 0, 0)
+
+    def _push_display(self, disp):
+        """Helper: push frame to queue and show on main thread."""
+        try:
+            self._frame_queue.put_nowait(disp)
+        except queue.Full:
+            pass
+        try:
+            cv2.imshow("Drone Camera", self._frame_queue.get_nowait())
+        except queue.Empty:
+            pass
+        cv2.waitKey(1)
 
     def _reset_pid(self):
         """Reset PID state (call before a new line-follow phase)."""
@@ -267,8 +391,9 @@ class Brain:
 
     # ── main sequence ────────────────────────────────────────────────────────
     def start(self):
-        """Force arm → takeoff → line1 → tag1: turn 45° CW → line2 → tag2: land"""
+        """Force arm → takeoff → line1 → tag1: turn 90° CW → line2 → tag2: land"""
         print("MAVLink connected. Starting flight sequence...")
+        tag_ids = []  # collect detected AprilTag IDs
 
         # 1. Set GUIDED mode
         self.control.set_mode('GUIDED')
@@ -287,9 +412,12 @@ class Brain:
 
         # 5. Phase 1 — follow line until first AprilTag is close enough
         print("=== Phase 1: following line to first AprilTag ===")
-        tag1_found = self.line_follow(duration=120, forward_speed=0.25, land_on_tag=False)
+        tag1_id = self.line_follow(duration=120, forward_speed=0.25, land_on_tag=False)
 
-        if tag1_found:
+        if tag1_id is not None:
+            tag_ids.append(tag1_id)
+            print(f"=== Phase 1 complete: detected AprilTag ID={tag1_id} ===")
+
             # 6. Turn 90° clockwise
             print("=== Turning 90° clockwise ===")
             self.control.turn_yaw(90)
@@ -300,7 +428,11 @@ class Brain:
 
             # 8. Phase 2 — follow next line to second AprilTag, then land
             print("=== Phase 2: following line to second AprilTag ===")
-            self.line_follow(duration=120, forward_speed=0.25, land_on_tag=True, tag_ignore_secs=10)
+            tag2_id = self.line_follow(duration=120, forward_speed=0.25,
+                                       land_on_tag=True, tag_ignore_secs=10)
+            if tag2_id is not None:
+                tag_ids.append(tag2_id)
+                print(f"=== Phase 2 complete: detected AprilTag ID={tag2_id} ===")
         else:
             print("Timed out on phase 1 without finding tag — landing.")
 
@@ -308,6 +440,19 @@ class Brain:
         self.control.land()
         print("Flight sequence complete.")
         cv2.destroyAllWindows()
+
+        # ── Print detected AprilTag IDs ──────────────────────────────────
+        print("")
+        print("=" * 50)
+        print("  DETECTED APRILTAG IDs")
+        print("=" * 50)
+        if len(tag_ids) >= 1:
+            print(f"  Tag 1 (phase 1):  ID = {tag_ids[0]}")
+        if len(tag_ids) >= 2:
+            print(f"  Tag 2 (phase 2):  ID = {tag_ids[1]}")
+        if not tag_ids:
+            print("  No tags detected.")
+        print("=" * 50)
 
     def __del__(self):
         """Destructor to ensure threads and windows are stopped"""
