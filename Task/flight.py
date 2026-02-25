@@ -164,11 +164,14 @@ class Brain:
         self._vy_smooth = 0.25 * raw + 0.75 * self._vy_smooth
         return self._vy_smooth
 
-    def line_follow(self, duration=30, forward_speed=0.2):
+    def line_follow(self, duration=30, forward_speed=0.2, land_on_tag=True):
         """
         PID line follower using the yellow line detected by the downward camera.
         Uses the bottom 40% of the frame as region-of-interest.
-        Runs for `duration` seconds then stops.
+        Runs for `duration` seconds, or until an AprilTag threshold is hit.
+        land_on_tag=True  → stop and return True (caller should land)
+        land_on_tag=False → stop and return True (caller should turn, then call again)
+        Returns True if tag triggered exit, False if timed out.
         """
         print(f"Line following for {duration}s  (forward={forward_speed} m/s)")
         fw = 640  # frame width — will update from first frame
@@ -219,7 +222,7 @@ class Brain:
                 cv2.putText(disp, f"TAG ID={tid}", (tcx - 30, tcy - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 if tarea >= self._tag_land_area:
-                    print(f"[TAG] Landing pad detected! (area={tarea:.0f}) — stopping and landing.")
+                    print(f"[TAG] Tag large enough (area={tarea:.0f}) — stopping.")
                     self.control.set_velocity(0, 0, 0)
                     time.sleep(0.5)
                     # Push final frame before breaking
@@ -227,7 +230,7 @@ class Brain:
                         self._frame_queue.put_nowait(disp)
                     except queue.Full:
                         pass
-                    break
+                    return True  # tag triggered exit
 
             print(f"[LINE] {status}")
             self.control.set_velocity(vx=forward_speed, vy=vy, vz=0)
@@ -249,10 +252,18 @@ class Brain:
         # Stop movement when done
         self.control.set_velocity(0, 0, 0)
         print("Line following complete.")
+        return False  # timed out, no tag triggered
+
+    def _reset_pid(self):
+        """Reset PID state (call before a new line-follow phase)."""
+        self._pid_integral = 0.0
+        self._pid_last_error = 0.0
+        self._pid_last_time = None
+        self._vy_smooth = 0.0
 
     # ── main sequence ────────────────────────────────────────────────────────
     def start(self):
-        """Force arm → takeoff 0.5 m → follow yellow line → land"""
+        """Force arm → takeoff → line1 → tag1: turn 45° CW → line2 → tag2: land"""
         print("MAVLink connected. Starting flight sequence...")
 
         # 1. Set GUIDED mode
@@ -270,14 +281,29 @@ class Brain:
         while self._latest_frame is None:
             time.sleep(0.05)
 
-        # 5. Follow the yellow line (up to 45 s, or until AprilTag pad detected)
-        self.line_follow(duration=120, forward_speed=0.25)
+        # 5. Phase 1 — follow line until first AprilTag is close enough
+        print("=== Phase 1: following line to first AprilTag ===")
+        tag1_found = self.line_follow(duration=120, forward_speed=0.25, land_on_tag=False)
 
-        cv2.destroyAllWindows()
+        if tag1_found:
+            # 6. Turn 90° clockwise
+            print("=== Turning 90° clockwise ===")
+            self.control.turn_yaw(90)
+            time.sleep(1.0)   # settle after turn
 
-        # 6. Land
+            # 7. Reset PID for fresh start on new line
+            self._reset_pid()
+
+            # 8. Phase 2 — follow next line to second AprilTag, then land
+            print("=== Phase 2: following line to second AprilTag ===")
+            self.line_follow(duration=120, forward_speed=0.25, land_on_tag=True)
+        else:
+            print("Timed out on phase 1 without finding tag — landing.")
+
+        # 9. Land
         self.control.land()
         print("Flight sequence complete.")
+        cv2.destroyAllWindows()
 
     def __del__(self):
         """Destructor to ensure threads and windows are stopped"""
