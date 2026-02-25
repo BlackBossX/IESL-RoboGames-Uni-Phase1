@@ -54,20 +54,20 @@ class Camera:
             self.camera_thread = None
 
     def get_frame(self, s):
-        """Get the latest camera frame (RGB from Webots, converted to BGR for OpenCV)"""
+        """Get the latest camera frame (Webots sends BGR via BGRA[:3], usable directly by OpenCV)"""
         # 1. Read Header (4 bytes: Width, Height)
         header_data = self._recv_all(s, 4)
         if not header_data: return None
         width, height = struct.unpack("=HH", header_data)
 
-        # 2. Read RGB image data (3 bytes per pixel)
+        # 2. Read image data (3 bytes per pixel — BGR from Webots)
         img_data = self._recv_all(s, width * height * 3)
         if not img_data: return None
 
-        # 3. Reshape as RGB then convert to BGR for OpenCV
-        frame_rgb = np.frombuffer(img_data, dtype=np.uint8).reshape((height, width, 3))
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        return frame_bgr
+        # Webots getImage() returns BGRA; server sends first 3 channels = BGR.
+        # OpenCV uses BGR natively — no conversion needed.
+        frame = np.frombuffer(img_data, dtype=np.uint8).reshape((height, width, 3))
+        return frame
 
 
     def is_running(self):

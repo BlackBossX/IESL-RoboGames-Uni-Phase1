@@ -194,6 +194,24 @@ class Control:
         print("Landed and motors disarmed!")
 
     
+    def set_velocity(self, vx, vy, vz):
+        """Send a single velocity command (body frame).
+        vx: forward+ / backward-
+        vy: right+ / left-
+        vz: down+ / up- (NED convention)
+        """
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
+            0b0000111111000111,  # velocity only
+            0, 0, 0,
+            vx, vy, vz,
+            0, 0, 0,
+            0, 0
+        )
+
     def move_with_velocity(self, vx, vy, vz, duration, dt=0.1):
         """Move the drone with specified velocities for a duration (in seconds)
         vx: forward/backward (positive = forward in drone's direction)

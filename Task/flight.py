@@ -38,7 +38,13 @@ class Brain:
         self.control = Control()
         self.camera = Camera()
         self._latest_detections = []
+        self._latest_frame = None            # raw BGR frame for line follow
         self._frame_queue = queue.Queue(maxsize=2)  # main-thread display queue
+
+        # PID state
+        self._pid_integral = 0.0
+        self._pid_last_error = 0.0
+        self._pid_last_time = None
 
     # ── frame processing (runs in camera thread) ─────────────────────────────
     def process_frame(self, frame):
@@ -46,6 +52,7 @@ class Brain:
         Detect colored objects in the frame, draw bounding boxes,
         show a live preview window, and store detections.
         """
+        self._latest_frame = frame          # store raw frame for line_follow()
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         display = frame.copy()
         detections = []
@@ -114,44 +121,110 @@ class Brain:
         """Return the most recently detected objects (thread-safe read)."""
         return list(self._latest_detections)
 
-    def line_follow(self):
+    def _pid(self, error, kp=0.002, ki=0.00005, kd=0.008):
+        """PID controller — returns output given pixel error."""
+        now = time.time()
+        dt = (now - self._pid_last_time) if self._pid_last_time else 0.05
+        self._pid_last_time = now
+        self._pid_integral += error * dt
+        self._pid_integral = max(-200, min(200, self._pid_integral))   # anti-windup
+        derivative = (error - self._pid_last_error) / max(dt, 1e-4)
+        self._pid_last_error = error
+        return kp * error + ki * self._pid_integral + kd * derivative
+
+    def line_follow(self, duration=30, forward_speed=0.2):
         """
-        Main line following logic.
-        Consider PID control for smoother movement.
-        Use the control class to send movement commands based on the detected line position.
+        PID line follower using the yellow line detected by the downward camera.
+        Uses the bottom 40% of the frame as region-of-interest.
+        Runs for `duration` seconds then stops.
         """
-        pass
+        print(f"Line following for {duration}s  (forward={forward_speed} m/s)")
+        fw = 640  # frame width — will update from first frame
+
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            frame = self._latest_frame
+            if frame is None:
+                time.sleep(0.02)
+                continue
+
+            fh, fw = frame.shape[:2]
+            roi = frame[int(fh * 0.6):, :]          # bottom 40 % of frame
+
+            # Detect yellow line in ROI
+            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lo_y, hi_y = COLOR_RANGES['yellow'][:2]
+            mask = cv2.inRange(hsv_roi, np.array(lo_y), np.array(hi_y))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                                    np.ones((5, 5), np.uint8))
+
+            M = cv2.moments(mask)
+            if M['m00'] > 500:                      # line found
+                cx = int(M['m10'] / M['m00'])       # centroid x in ROI
+                error = cx - fw // 2                # +ve = line is right → steer right
+                vy = self._pid(error)
+                vy = max(-0.5, min(0.5, vy))        # clamp lateral speed
+                status = f"Line @ x={cx}  err={error:+d}  vy={vy:+.3f}"
+
+                # Draw line position on latest display frame
+                disp = frame.copy()
+                cv2.line(disp, (cx, int(fh * 0.6)), (cx, fh), (0, 255, 255), 2)
+                cv2.putText(disp, status, (8, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            else:                                   # line lost — stop moving laterally
+                vy = 0.0
+                status = "Line LOST"
+                disp = frame.copy()
+                cv2.putText(disp, status, (8, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            print(f"[LINE] {status}")
+            self.control.set_velocity(vx=forward_speed, vy=vy, vz=0)
+
+            # Push to display queue
+            try:
+                self._frame_queue.put_nowait(disp)
+            except queue.Full:
+                pass
+
+            # Show frame on main thread
+            try:
+                f = self._frame_queue.get_nowait()
+                cv2.imshow("Drone Camera", f)
+            except queue.Empty:
+                pass
+            cv2.waitKey(1)
+
+        # Stop movement when done
+        self.control.set_velocity(0, 0, 0)
+        print("Line following complete.")
 
     # ── main sequence ────────────────────────────────────────────────────────
     def start(self):
-        """Force arm → takeoff 3 m → hover & track → land"""
+        """Force arm → takeoff 0.5 m → follow yellow line → land"""
         print("MAVLink connected. Starting flight sequence...")
 
         # 1. Set GUIDED mode
         self.control.set_mode('GUIDED')
 
-        # 2. Force arm (bypasses pre-arm checks)
+        # 2. Force arm
         self.control.force_arm()
 
-        # 3. Takeoff to 3 m
-        self.control.takeoff(3.0)
+        # 3. Takeoff to 0.5 m (low enough to see the line clearly)
+        self.control.takeoff(0.5)
 
-        # 4. Start camera now that drone is airborne
+        # 4. Start camera
         self.camera.start_thread(self.process_frame)
-        print("Camera started — tracking objects for 10 seconds...")
+        print("Camera started. Waiting for first frame...")
+        while self._latest_frame is None:
+            time.sleep(0.05)
 
-        # 5. Display loop runs on main thread (required by Qt/GTK)
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            try:
-                frame = self._frame_queue.get(timeout=0.05)
-                cv2.imshow("Drone Camera", frame)
-            except queue.Empty:
-                pass
-            cv2.waitKey(1)
+        # 5. Follow the yellow line for 30 seconds
+        self.line_follow(duration=30, forward_speed=0.2)
+
         cv2.destroyAllWindows()
 
-        # 5. Land back to ground
+        # 6. Land
         self.control.land()
         print("Flight sequence complete.")
 
