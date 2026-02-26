@@ -2,16 +2,17 @@
 This contains the opencv, line following stuff. This will make the decisions for the robot based on what the camera sees and 
 send commands to the controller.
 '''
+import os
+# MUST set before importing cv2 so Qt picks up xcb backend
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
+os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
+
 import cv2
 import numpy as np
 from control import Control
 import time
 from sensor import Camera
 import queue
-import os
-
-# Force OpenCV to use X11/XCB backend (avoids Wayland Qt crash)
-os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
 
 # ── HSV color ranges for detection (H: 0-179, S: 0-255, V: 0-255) ──────────
 COLOR_RANGES = {
@@ -39,6 +40,7 @@ class Brain:
         self.camera = Camera()
         self._latest_detections = []
         self._latest_frame = None            # raw BGR frame for line follow
+        self._latest_display = None          # annotated frame from process_frame
         self._frame_queue = queue.Queue(maxsize=2)  # main-thread display queue
 
         # PID state
@@ -56,22 +58,23 @@ class Brain:
     # ── frame processing (runs in camera thread) ─────────────────────────────
     def process_frame(self, frame):
         """
-        Detect colored objects in the frame, draw bounding boxes,
-        show a live preview window, and store detections.
+        Detect colored objects in the frame, draw enhanced bounding boxes,
+        and store detections.
         """
         self._latest_frame = frame          # store raw frame for line_follow()
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         display = frame.copy()
+        overlay = frame.copy()
         detections = []
+        fh, fw = display.shape[:2]
 
         for color_name, ranges in COLOR_RANGES.items():
             lo1, hi1, lo2, hi2 = ranges
 
             mask = cv2.inRange(hsv, np.array(lo1), np.array(hi1))
-            if lo2 is not None:                          # red wraps around 0/180
+            if lo2 is not None:
                 mask |= cv2.inRange(hsv, np.array(lo2), np.array(hi2))
 
-            # Clean up the mask
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
                                     np.ones((5, 5), np.uint8))
             mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=2)
@@ -92,36 +95,48 @@ class Brain:
                     'area':  area,
                 })
 
-                # Draw bounding box + label
                 bgr = DRAW_COLOR[color_name]
-                cv2.rectangle(display, (x, y), (x + w, y + h), bgr, 2)
-                label = f"{color_name} ({area:.0f}px)"
-                cv2.putText(display, label, (x, y - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, bgr, 2)
-                cv2.circle(display, (cx, cy), 4, bgr, -1)
+
+                # Semi-transparent filled contour
+                cv2.fillPoly(overlay, [cnt], bgr)
+
+                # Corner-bracket style box
+                t = max(2, min(w, h) // 6)   # bracket arm length
+                lw = 2
+                for px, py in [(x, y), (x+w, y), (x, y+h), (x+w, y+h)]:
+                    sx = 1 if px == x else -1
+                    sy = 1 if py == y else -1
+                    cv2.line(display, (px, py), (px + sx*t, py), bgr, lw+1)
+                    cv2.line(display, (px, py), (px, py + sy*t), bgr, lw+1)
+                # Thin full rect
+                cv2.rectangle(display, (x, y), (x+w, y+h), bgr, 1)
+
+                # Label with dark background
+                label = f"{color_name}  {area:.0f}px"
+                (lw2, lh2), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(display, (x, y - lh2 - 10), (x + lw2 + 6, y), (0, 0, 0), -1)
+                cv2.putText(display, label, (x + 3, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 1)
+
+                # Centre dot + crosshair
+                cv2.circle(display, (cx, cy), 5, bgr, -1)
+                cv2.circle(display, (cx, cy), 10, bgr, 1)
+
+        # Blend semi-transparent overlay
+        cv2.addWeighted(overlay, 0.18, display, 0.82, 0, display)
 
         # Frame-centre crosshair
-        fh, fw = display.shape[:2]
-        cv2.line(display, (fw // 2 - 15, fh // 2),
-                           (fw // 2 + 15, fh // 2), (200, 200, 200), 1)
-        cv2.line(display, (fw // 2, fh // 2 - 15),
-                           (fw // 2, fh // 2 + 15), (200, 200, 200), 1)
+        cv2.line(display, (fw//2 - 20, fh//2), (fw//2 + 20, fh//2), (220, 220, 220), 1)
+        cv2.line(display, (fw//2, fh//2 - 20), (fw//2, fh//2 + 20), (220, 220, 220), 1)
+        cv2.circle(display, (fw//2, fh//2), 4, (220, 220, 220), 1)
 
-        info = f"Objects: {len(detections)}"
-        cv2.putText(display, info, (8, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        # Push annotated frame to main thread for display (non-blocking)
-        try:
-            self._frame_queue.put_nowait(display)
-        except queue.Full:
-            pass  # drop frame if main thread is busy
+        # Top-left HUD
+        cv2.rectangle(display, (0, 0), (200, 26), (0, 0, 0), -1)
+        cv2.putText(display, f"Objects: {len(detections)}", (6, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
         self._latest_detections = detections
-        if detections:
-            for d in detections:
-                print(f"[DETECT] {d['color']:6s}  area={d['area']:6.0f}  "
-                      f"center={d['center']}")
+        self._latest_display = display      # save annotated frame for line_follow
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def get_detections(self):
@@ -185,74 +200,109 @@ class Brain:
             fh, fw = frame.shape[:2]
             roi = frame[int(fh * 0.6):, :]          # bottom 40 % of frame
 
-            # Detect yellow line in ROI
-            hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            lo_y, hi_y = COLOR_RANGES['yellow'][:2]
-            mask = cv2.inRange(hsv_roi, np.array(lo_y), np.array(hi_y))
+            # Detect yellow line in ROI using brightness threshold
+            # (grayscale stream: yellow strip ≈ 170-226, dark floor ≈ 50-100)
+            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            _, mask = cv2.threshold(gray_roi, 150, 255, cv2.THRESH_BINARY)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
                                     np.ones((5, 5), np.uint8))
 
             M = cv2.moments(mask)
+            roi_y0 = int(fh * 0.6)
+            # Use color-annotated frame as base so object overlays are visible
+            disp = self._latest_display.copy() if self._latest_display is not None else frame.copy()
+
+            # Draw ROI boundary
+            cv2.rectangle(disp, (0, roi_y0), (fw - 1, fh - 1), (80, 80, 80), 1)
+            cv2.putText(disp, "ROI", (4, roi_y0 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+
             if M['m00'] > 500:                      # line found
                 cx = int(M['m10'] / M['m00'])       # centroid x in ROI
-                error = cx - fw // 2                # +ve = line is right → steer right
+                error = cx - fw // 2
                 vy = self._pid(error)
-                vy = max(-0.15, min(0.15, vy))      # tight clamp for smooth flight
-                status = f"Line @ x={cx}  err={error:+d}  vy={vy:+.3f}"
+                vy = max(-0.15, min(0.15, vy))
 
-                # Draw line position on latest display frame
-                disp = frame.copy()
-                cv2.line(disp, (cx, int(fh * 0.6)), (cx, fh), (0, 255, 255), 2)
-                cv2.putText(disp, status, (8, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            else:                                   # line lost — stop moving laterally
+                # Tint ROI with green mask overlay
+                roi_tint = np.zeros_like(disp)
+                roi_tint[roi_y0:, :] = cv2.merge([
+                    np.zeros_like(mask), mask, np.zeros_like(mask)])  # green channel
+                cv2.addWeighted(roi_tint, 0.25, disp, 1.0, 0, disp)
+
+                # Vertical line at line centroid (full ROI height)
+                cv2.line(disp, (cx, roi_y0), (cx, fh), (0, 255, 255), 2)
+
+                # Frame centre vertical guide
+                cv2.line(disp, (fw//2, roi_y0), (fw//2, fh), (100, 100, 100), 1)
+
+                # Error bar — horizontal arrow from centre to line
+                bar_y = roi_y0 + (fh - roi_y0) // 2
+                err_color = (0, 200, 255) if abs(error) < 20 else \
+                            (0, 140, 255) if abs(error) < 40 else (0, 60, 255)
+                cv2.arrowedLine(disp, (fw//2, bar_y), (cx, bar_y), err_color, 2, tipLength=0.15)
+                cv2.circle(disp, (cx, bar_y), 5, err_color, -1)
+
+                # HUD panel — line info
+                hud = [(f"Line  x={cx}", (0, 255, 255)),
+                       (f"Err  {error:+d} px",  err_color),
+                       (f"Vy   {vy:+.3f} m/s", (200, 255, 200))]
+                for i, (txt, col) in enumerate(hud):
+                    yy = 48 + i * 22
+                    cv2.rectangle(disp, (0, yy - 16), (210, yy + 4), (0, 0, 0), -1)
+                    cv2.putText(disp, txt, (6, yy),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1)
+            else:                                   # line lost
                 vy = 0.0
-                status = "Line LOST"
-                disp = frame.copy()
-                cv2.putText(disp, status, (8, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.rectangle(disp, (0, 40), (160, 68), (0, 0, 180), -1)
+                cv2.putText(disp, "LINE LOST", (6, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 255), 2)
 
-            # ── AprilTag detection — scan entire frame (skipped during ignore window) ──
+            # ── AprilTag detection ──────────────────────────────────────────
             if time.time() >= tag_ignore_until:
                 tag = self._detect_apriltag(frame)
             else:
-                tag = None  # still in ignore window
+                tag = None
 
             if tag is not None:
                 tid, tcx, tcy, tarea, tcorners = tag
                 print(f"[TAG] AprilTag ID={tid}  area={tarea:.0f}  center=({tcx},{tcy})")
+
+                # Draw tag outline + filled corners
                 cv2.aruco.drawDetectedMarkers(disp, [tcorners], np.array([[tid]]))
-                cv2.putText(disp, f"TAG ID={tid}", (tcx - 30, tcy - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                for pt in tcorners[0].astype(int):
+                    cv2.circle(disp, tuple(pt), 5, (0, 255, 0), -1)
+
+                # Centre rings
+                cv2.circle(disp, (tcx, tcy), 8,  (0, 255, 0), 2)
+                cv2.circle(disp, (tcx, tcy), 16, (0, 255, 0), 1)
+                cv2.drawMarker(disp, (tcx, tcy), (0, 255, 0),
+                               cv2.MARKER_CROSS, 20, 1)
+
+                # Tag label box
+                tag_label = f" TAG {tid}  {tarea:.0f}px "
+                (tlw, tlh), _ = cv2.getTextSize(tag_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(disp, (tcx - tlw//2 - 2, tcy - 36),
+                                    (tcx + tlw//2 + 2, tcy - 36 + tlh + 8), (0, 80, 0), -1)
+                cv2.putText(disp, tag_label, (tcx - tlw//2, tcy - 36 + tlh),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
                 if tarea >= self._tag_land_area:
+                    # Flash red border
+                    cv2.rectangle(disp, (2, 2), (fw-2, fh-2), (0, 0, 255), 4)
+                    cv2.rectangle(disp, (0, fh-32), (fw, fh), (0, 0, 180), -1)
+                    cv2.putText(disp, "LANDING ON TAG", (fw//2 - 100, fh - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    self._push_display(disp)
                     print(f"[TAG] Tag large enough (area={tarea:.0f}) — stopping.")
                     self.control.set_velocity(0, 0, 0)
                     time.sleep(0.3)
                     if land_on_tag:
                         print("[TAG] Preparing to land on box...")
                         self._center_on_box()
-                    # Push final frame before breaking
-                    try:
-                        self._frame_queue.put_nowait(disp)
-                    except queue.Full:
-                        pass
-                    return tid  # return the detected tag ID
+                    return tid
 
+            self._push_display(disp)
             self.control.set_velocity(vx=forward_speed, vy=vy, vz=0)
-
-            # Push to display queue
-            try:
-                self._frame_queue.put_nowait(disp)
-            except queue.Full:
-                pass
-
-            # Show frame on main thread
-            try:
-                f = self._frame_queue.get_nowait()
-                cv2.imshow("Drone Camera", f)
-            except queue.Empty:
-                pass
-            cv2.waitKey(1)
 
         # Stop movement when done
         self.control.set_velocity(0, 0, 0)
@@ -374,13 +424,13 @@ class Brain:
         self.control.set_velocity(0, 0, 0)
 
     def _push_display(self, disp):
-        """Helper: push frame to queue and show on main thread."""
+        """Push annotated frame to the live preview window (main thread only)."""
         try:
             self._frame_queue.put_nowait(disp)
         except queue.Full:
             pass
         try:
-            cv2.imshow("Drone Camera", self._frame_queue.get_nowait())
+            cv2.imshow('Drone Camera', self._frame_queue.get_nowait())
         except queue.Empty:
             pass
         cv2.waitKey(1)
@@ -408,6 +458,8 @@ class Brain:
         self.control.takeoff(1.5)
 
         # 4. Start camera
+        cv2.namedWindow('Drone Camera', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Drone Camera', 640, 480)
         self.camera.start_thread(self.process_frame)
         print("Camera started. Waiting for first frame...")
         while self._latest_frame is None:
@@ -458,7 +510,7 @@ class Brain:
         print("=" * 50)
 
     def __del__(self):
-        """Destructor to ensure threads and windows are stopped"""
+        """Destructor to ensure threads are stopped."""
         self.camera.stop_thread()
         cv2.destroyAllWindows()
 
