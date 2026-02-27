@@ -48,6 +48,8 @@ class Brain:
         self._pid_last_error = 0.0
         self._pid_last_time = None
         self._vy_smooth = 0.0          # smoothed lateral output
+        self._deriv_smooth = 0.0       # EMA-filtered derivative
+        self._prev_vy = 0.0            # for rate limiter
 
         # AprilTag detector (tag36h11 family used in world)
         self._tag_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
@@ -161,9 +163,11 @@ class Brain:
                 best = (int(ids[i][0]), cx, cy, area, tc)
         return best
 
-    def _pid(self, error, kp=0.0005, ki=0.000001, kd=0.006, deadband=18):
+    def _pid(self, error, kp=0.0004, ki=0.0000008, kd=0.0025, deadband=25):
         """PID controller — returns smoothed output given pixel error.
         deadband: errors smaller than this many pixels are treated as zero.
+        Derivative is EMA-filtered (alpha=0.25) to reduce noise.
+        Output EMA alpha=0.30.  Rate-limited to ±0.010 m/s per loop.
         """
         if abs(error) < deadband:
             error = 0  # ignore tiny wobble
@@ -172,12 +176,18 @@ class Brain:
         self._pid_last_time = now
         self._pid_integral += error * dt
         self._pid_integral = max(-100, min(100, self._pid_integral))   # anti-windup
-        derivative = (error - self._pid_last_error) / max(dt, 1e-4)
+        raw_deriv = (error - self._pid_last_error) / max(dt, 1e-4)
         self._pid_last_error = error
-        raw = kp * error + ki * self._pid_integral + kd * derivative
-        # Exponential moving average — alpha=0.15 keeps only 15% new, 85% old
-        self._vy_smooth = 0.15 * raw + 0.85 * self._vy_smooth
-        return self._vy_smooth
+        # Derivative EMA filter (alpha=0.25) — suppresses high-frequency noise
+        self._deriv_smooth = 0.25 * raw_deriv + 0.75 * self._deriv_smooth
+        raw = kp * error + ki * self._pid_integral + kd * self._deriv_smooth
+        # Output EMA alpha=0.30
+        self._vy_smooth = 0.30 * raw + 0.70 * self._vy_smooth
+        # Rate limiter: max change of ±0.010 m/s per loop
+        delta = self._vy_smooth - self._prev_vy
+        delta = max(-0.010, min(0.010, delta))
+        self._prev_vy = self._prev_vy + delta
+        return self._prev_vy
 
     def line_follow(self, duration=30, forward_speed=0.2, land_on_tag=True, tag_ignore_secs=0):
         """
@@ -311,117 +321,175 @@ class Brain:
 
     def _detect_box_center(self, frame):
         """
-        Detect the landing-pad box (a large roughly-square gray/white object)
-        by finding the biggest near-square contour in the frame.
-        Returns (cx, cy, w, h) or None.
+        Detect the landing pad by its bright WHITE edge.
+        Finds the largest 4-corner quadrilateral from the white contour,
+        computes geometric center as average of the 4 corners.
+        Returns (cx, cy, pts_4x2, area) or None.
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # Threshold to isolate the lighter box against the darker floor
-        _, thresh = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE,
-                                  np.ones((15, 15), np.uint8))
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,
-                                  np.ones((7, 7), np.uint8))
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
+        # High threshold — only grab the bright white box edge
+        _, thresh = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY)
+        # Sort all contours largest-first
+        contours, _ = cv2.findContours(thresh, cv2.RETR_LIST,
                                        cv2.CHAIN_APPROX_SIMPLE)
-        best, best_area = None, 3000  # minimum area threshold
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < best_area:
-                continue
-            x, y, w, h = cv2.boundingRect(cnt)
-            aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
-            if aspect < 0.4:  # skip very elongated shapes
-                continue
-            if area > best_area:
-                best_area = area
-                cx = x + w // 2
-                cy = y + h // 2
-                best = (cx, cy, w, h)
-        return best
+            if area < 2000:
+                break   # already sorted, nothing bigger coming
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+            if len(approx) == 4:
+                pts = approx.reshape(4, 2)
+                sides = [np.linalg.norm(pts[i] - pts[(i+1) % 4])
+                         for i in range(4)]
+                if max(sides) == 0:
+                    continue
+                if min(sides) / max(sides) > 0.45:   # roughly square
+                    cx = int(np.mean(pts[:, 0]))
+                    cy = int(np.mean(pts[:, 1]))
+                    return (cx, cy, pts, area)
+        return None
 
-    def _center_on_box(self, timeout=25.0):
+    def _center_on_box(self, timeout=60.0):
         """
-        Detect the physical landing box (gray/white rectangle), nudge toward
-        its centre, then descend slowly. No re-centering — commit and land.
+        Lock on the AprilTag / white-edge box center and land immediately.
+
+        Logic:
+          - Nudge slightly forward (NUDGE_FWD) every frame to keep the pad
+            from drifting behind the drone.
+          - Correct left/right with proportional control (no backward allowed).
+          - After 3 consecutive frames within LOCK_THRESH px → locked, descend.
+          - During descent keep correcting laterally all the way down.
         """
-        # ── Step 0: full stop and hover ──────────────────────────────────
-        print("[BOX] Stopping to locate box...")
+        self._box_landed = False
+        LOCK_THRESH  = 25    # px — acceptable centering error
+        STABLE_NEED  = 3     # consecutive good frames to call it locked
+        NUDGE_FWD    = 0.03  # m/s constant tiny forward push while centering
+
+        # Short stop — just enough to kill momentum
         self.control.set_velocity(0, 0, 0)
-        time.sleep(2.0)
+        time.sleep(0.5)
 
-        # ── Step 1: detect box and nudge toward its centre ───────────────
-        print("[BOX] Detecting box shape...")
-        deadline = time.time() + 12.0
-        nudged = False
+        def _get_error(frame):
+            fh, fw = frame.shape[:2]
+            tag = self._detect_apriltag(frame)
+            if tag is not None:
+                tid, tcx, tcy, tarea, tcorners = tag
+                return tcx - fw // 2, tcy - fh // 2, 'tag', (tcx, tcy, tcorners, tid)
+            result = self._detect_box_center(frame)
+            if result is not None:
+                bcx, bcy, pts, _ = result
+                return bcx - fw // 2, bcy - fh // 2, 'box', (bcx, bcy, pts)
+            return None
+
+        # ── Phase 1: center & lock ────────────────────────────────────────
+        print("[LAND] Locking onto pad...")
+        stable = 0
+        deadline = time.time() + 15.0   # fast timeout — don't hang forever
+
         while time.time() < deadline:
             frame = self._latest_frame
             if frame is None:
-                time.sleep(0.05)
+                time.sleep(0.03)
                 continue
+
             fh, fw = frame.shape[:2]
-            box = self._detect_box_center(frame)
-            disp = frame.copy()
-            if box is not None:
-                bcx, bcy, bw, bh = box
-                ex = bcx - fw // 2
-                ey = bcy - fh // 2
-                # Draw box outline
-                cv2.rectangle(disp, (bcx - bw // 2, bcy - bh // 2),
-                              (bcx + bw // 2, bcy + bh // 2), (255, 0, 255), 2)
-                cv2.circle(disp, (bcx, bcy), 6, (255, 0, 255), -1)
-                cv2.putText(disp, f"BOX ex={ex:+d} ey={ey:+d} ({bw}x{bh})",
-                            (8, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-                print(f"[BOX] centre=({bcx},{bcy}) ex={ex:+d} ey={ey:+d} size={bw}x{bh}")
+            disp   = frame.copy()
+            det    = _get_error(frame)
 
-                # Nudge: move proportionally, cap at 0.10 m/s, for 1.5–4 s
-                vy = max(-0.10, min(0.10, ex * 0.0015))
-                vx = max(-0.10, min(0.10, ey * 0.0015))
-                nudge_time = max(1.5, min(4.0, max(abs(ex), abs(ey)) * 0.015))
-                print(f"[BOX] Nudging vx={vx:+.3f} vy={vy:+.3f} for {nudge_time:.1f}s")
-                t_end = time.time() + nudge_time
-                while time.time() < t_end:
-                    self.control.set_velocity(vx=vx, vy=vy, vz=0)
-                    time.sleep(0.1)
-                self.control.set_velocity(0, 0, 0)
-                time.sleep(1.0)  # settle
-                nudged = True
-                break
+            if det is not None:
+                ex, ey, source, info = det
+
+                # Draw target
+                if source == 'tag':
+                    tcx, tcy, tcorners, tid = info
+                    cv2.aruco.drawDetectedMarkers(disp, [tcorners], np.array([[tid]]))
+                    cv2.circle(disp, (tcx, tcy), 10, (0, 255, 0), 2)
+                    cv2.drawMarker(disp, (tcx, tcy), (0, 255, 0), cv2.MARKER_CROSS, 22, 2)
+                else:
+                    bcx, bcy, pts = info
+                    for i in range(4):
+                        cv2.line(disp, tuple(pts[i]), tuple(pts[(i+1) % 4]), (255, 0, 255), 2)
+                    cv2.drawMarker(disp, (bcx, bcy), (255, 0, 255), cv2.MARKER_CROSS, 18, 2)
+
+                cv2.drawMarker(disp, (fw // 2, fh // 2), (0, 255, 255), cv2.MARKER_CROSS, 18, 1)
+                col = (0, 255, 0) if abs(ex) < LOCK_THRESH and abs(ey) < LOCK_THRESH else (0, 180, 255)
+                cv2.rectangle(disp, (0, 0), (fw, 32), (0, 0, 0), -1)
+                cv2.putText(disp, f"[{source}] err=({ex:+d},{ey:+d})  lock={stable}/{STABLE_NEED}",
+                            (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, col, 1)
+
+                if abs(ex) < LOCK_THRESH and abs(ey) < LOCK_THRESH:
+                    stable += 1
+                    self.control.set_velocity(NUDGE_FWD, 0, 0)   # tiny fwd creep while locked
+                    if stable >= STABLE_NEED:
+                        print(f"[LAND] LOCKED [{source}] err=({ex:+d},{ey:+d}) — descending")
+                        self._push_display(disp)
+                        break
+                else:
+                    stable = 0
+                    # Lateral correction + constant tiny forward nudge
+                    vy_c = max(-0.10, min(0.10, ex * 0.0030))
+                    vx_c = max(NUDGE_FWD, min(0.12, NUDGE_FWD + ey * 0.0030))  # fwd-only
+                    self.control.set_velocity(vx=vx_c, vy=vy_c, vz=0)
             else:
-                cv2.putText(disp, "BOX: searching...", (8, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                stable = 0
+                cv2.rectangle(disp, (0, 0), (fw, 32), (0, 0, 0), -1)
+                cv2.putText(disp, "LAND: searching...", (6, 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 255), 1)
+                # Creep forward so pad comes into view
+                self.control.set_velocity(NUDGE_FWD, 0, 0)
+
             self._push_display(disp)
-            time.sleep(0.1)
+            time.sleep(0.04)
 
-        if not nudged:
-            print("[BOX] Could not detect box — landing at current position.")
+        # Full stop — kill all momentum before descending
+        self.control.set_velocity(0, 0, 0)
+        time.sleep(0.3)
 
-        # ── Step 2: slow straight descent — no re-centering ──────────────
-        print("[BOX] Descending slowly...")
-        descent_deadline = time.time() + timeout
-        while time.time() < descent_deadline:
+        # ── Phase 2: straight vertical descent — no lateral movement ──────
+        print("[LAND] Descending straight down (locked, no corrections)...")
+        t_end  = time.time() + timeout
+        last_alt = 3.0
+
+        while time.time() < t_end:
             alt_msg = self.control.master.recv_match(
                 type='GLOBAL_POSITION_INT', blocking=False)
             if alt_msg:
-                alt = alt_msg.relative_alt / 1000.0
-                if alt < 0.30:
-                    # Slow down even more for the final stretch
-                    self.control.set_velocity(vx=0, vy=0, vz=0.03)
-                if alt < 0.08:
-                    print(f"[BOX] Altitude {alt:.2f} m — handing off to land.")
-                    self.control.set_velocity(0, 0, 0)
-                    break
+                last_alt = alt_msg.relative_alt / 1000.0
+
+            if last_alt <= 0.15:
+                print(f"[LAND] {last_alt:.2f} m — LAND command.")
+                self.control.set_velocity(0, 0, 0)
+                self.control.land()
+                self._box_landed = True
+                return
+
+            vz = 0.35 if last_alt > 1.50 else \
+                 0.20 if last_alt > 0.80 else \
+                 0.10 if last_alt > 0.40 else 0.05
+
+            # Pure vertical — no vx, no vy
+            self.control.set_velocity(vx=0, vy=0, vz=vz)
+
+            # Display only
             frame = self._latest_frame
             if frame is not None:
                 disp = frame.copy()
-                cv2.putText(disp, "LANDING...", (8, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                fh, fw = disp.shape[:2]
+                cv2.drawMarker(disp, (fw // 2, fh // 2), (0, 255, 255), cv2.MARKER_CROSS, 18, 1)
+                cv2.rectangle(disp, (0, 0), (280, 28), (0, 0, 0), -1)
+                cv2.putText(disp, f"ALT {last_alt:.2f}m  vz={vz:.2f}  LOCKED",
+                            (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 128), 1)
                 self._push_display(disp)
-            # Very slow descent, no lateral movement
-            self.control.set_velocity(vx=0, vy=0, vz=0.06)
-            time.sleep(0.05)
 
+            time.sleep(0.04)
+
+        print("[LAND] Timeout — LAND command.")
         self.control.set_velocity(0, 0, 0)
+        self.control.land()
+        self._box_landed = True
 
     def _push_display(self, disp):
         """Push annotated frame to the live preview window (main thread only)."""
@@ -437,10 +505,12 @@ class Brain:
 
     def _reset_pid(self):
         """Reset PID state (call before a new line-follow phase)."""
-        self._pid_integral = 0.0
+        self._pid_integral   = 0.0
         self._pid_last_error = 0.0
-        self._pid_last_time = None
-        self._vy_smooth = 0.0
+        self._pid_last_time  = None
+        self._vy_smooth      = 0.0
+        self._deriv_smooth   = 0.0
+        self._prev_vy        = 0.0
 
     # ── main sequence ────────────────────────────────────────────────────────
     def start(self):
@@ -454,8 +524,8 @@ class Brain:
         # 2. Force arm
         self.control.force_arm()
 
-        # 3. Takeoff to 1.5 m — high enough for camera to see full tag box
-        self.control.takeoff(1.5)
+        # 3. Takeoff to 2.2 m — wider FOV for larger/more stable line centroid
+        self.control.takeoff(2.2)
 
         # 4. Start camera
         cv2.namedWindow('Drone Camera', cv2.WINDOW_NORMAL)
@@ -467,7 +537,7 @@ class Brain:
 
         # 5. Phase 1 — follow line until first AprilTag is close enough
         print("=== Phase 1: following line to first AprilTag ===")
-        tag1_id = self.line_follow(duration=120, forward_speed=0.25, land_on_tag=False)
+        tag1_id = self.line_follow(duration=120, forward_speed=0.20, land_on_tag=False)
 
         if tag1_id is not None:
             tag_ids.append(tag1_id)
@@ -483,7 +553,7 @@ class Brain:
 
             # 8. Phase 2 — follow next line to second AprilTag, then land
             print("=== Phase 2: following line to second AprilTag ===")
-            tag2_id = self.line_follow(duration=120, forward_speed=0.25,
+            tag2_id = self.line_follow(duration=120, forward_speed=0.20,
                                        land_on_tag=True, tag_ignore_secs=10)
             if tag2_id is not None:
                 tag_ids.append(tag2_id)
